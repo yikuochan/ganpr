@@ -138,6 +138,7 @@ jobs:
             -s \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+            -H "extra-parameters: pass-through" \
             -d "$REQUEST_DATA")
           
           # 檢查 API 呼叫是否成功 | Check if API call was successful
