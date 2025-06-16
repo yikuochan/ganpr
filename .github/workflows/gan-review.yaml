@@ -1,0 +1,217 @@
+name: PR CI -CanPRDev Project Review # 工作流程名稱，更改為 Python 專案 | Workflow name, changed for Python projects
+
+on:
+  pull_request:
+    branches:
+      - main # 觸發條件：在 main 分支的 Pull Request | Trigger condition: Pull Request to the main branch
+
+# 環境變數設定 | Environment variables configuration
+env:
+  PYTHON_VERSION: '3.9'
+  MAX_DIFF_SIZE: 6000
+  OPENAI_MODEL: 'gpt-4o'
+  REVIEW_TITLE: '🤖 **AI 程式碼審查意見 | AI Code Review Feedback**'
+
+# 明確設定權限 | Explicitly set permissions
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  build-and-test:
+    name: Build and Test # 作業名稱 | Job name
+    runs-on: ubuntu-latest # 執行環境 | Execution environment
+
+    steps:
+      - name: Checkout code # 步驟：檢出程式碼 | Step: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0 # 獲取完整的 git 歷史記錄，以便進行更好的差異比較 | Get the complete git history for better diff comparison
+
+      - name: Set up Python # 步驟：設定 Python 環境 | Step: Set up Python environment
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }} # 使用環境變數設定 Python 版本 | Use environment variable for Python version
+
+      - name: Cache pip dependencies # 步驟：快取 pip 依賴 | Step: Cache pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies # 步驟：安裝 Python 依賴 | Step: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt # 安裝專案依賴 | Install project dependencies
+          else
+            echo "No requirements.txt found, skipping dependency installation"
+          fi
+          # 安裝必要的工具 | Install necessary tools
+          pip install jq
+
+      - name: Notify Review Start # 步驟：通知審查開始 | Step: Notify review start
+        uses: peter-evans/create-or-update-comment@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            🔍 AI code review process started. Please wait while I analyze your code...
+
+      - name: Get PR Diff and Determine Size # 步驟：獲取 PR 差異並確定大小 | Step: Get PR diff and determine size
+        id: diff
+        run: |
+          echo "Getting diff for PR #${{ github.event.pull_request.number }}"
+          git fetch origin main # 獲取主分支的最新狀態 | Fetch the latest state of the main branch
+          git diff origin/main > diff.txt # 將差異寫入 diff.txt 檔案 | Write the diff to diff.txt file
+          
+          # 確定 PR 大小 | Determine PR size
+          DIFF_SIZE=$(cat diff.txt | wc -c)
+          echo "diff_size=$DIFF_SIZE" >> $GITHUB_OUTPUT
+          if [ $DIFF_SIZE -gt ${{ env.MAX_DIFF_SIZE }} ]; then
+            echo "is_large=true" >> $GITHUB_OUTPUT
+            echo "PR is large ($DIFF_SIZE bytes), will analyze most important parts only"
+          else
+            echo "is_large=false" >> $GITHUB_OUTPUT
+            echo "PR is manageable size ($DIFF_SIZE bytes), will analyze completely"
+          fi
+
+      - name: Process Large PR # 步驟：處理大型 PR | Step: Process large PR
+        if: steps.diff.outputs.is_large == 'true'
+        run: |
+          echo "PR is too large for complete analysis. Analyzing most important files only..."
+          # 尋找最重要的檔案（例如 Python 檔案，排除測試檔案）| Find most important files (e.g., Python files, excluding test files)
+          git diff --name-only origin/main | grep -E '\.py$' | grep -v '_test\.py$' | grep -v 'test_' | head -10 > important_files.txt
+          
+          # 只提取重要檔案的差異 | Extract diff only for important files
+          > filtered_diff.txt
+          while IFS= read -r file; do
+            echo "Including $file in analysis"
+            git diff origin/main -- "$file" >> filtered_diff.txt
+          done < important_files.txt
+          
+          # 使用過濾後的差異替換原始差異 | Replace original diff with filtered diff
+          mv filtered_diff.txt diff.txt
+
+      # 可選的 SonarQube 掃描 | Optional SonarQube scan
+      - name: SonarQube Scan
+        if: ${{ vars.USE_SONARQUBE == 'true' }}
+        id: sonarqube-scan
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONARQUBE_URL }}
+        continue-on-error: true
+
+      - name: Call OpenAI for Review # 步驟：呼叫 OpenAI 進行審查 | Step: Call OpenAI for Review
+        id: openai_review
+        continue-on-error: true # 允許此步驟失敗但繼續工作流程 | Allow this step to fail but continue the workflow
+        run: |
+          echo "Calling OpenAI API to analyze code diff..."
+          # 限制 DIFF_CONTENT 的大小，以避免超過 OpenAI API 的 Token 限制
+          # 注意：這裡使用 head -c ${{ env.MAX_DIFF_SIZE }} 限制字節數，確保 diff 檔案不會太大
+          # Limit DIFF_CONTENT size to avoid exceeding OpenAI API Token limits.
+          # Note: Using head -c ${{ env.MAX_DIFF_SIZE }} to limit bytes, ensuring the diff file isn't too large.
+          DIFF_CONTENT=$(cat diff.txt | head -c ${{ env.MAX_DIFF_SIZE }} | jq -Rs .)
+
+          # 構建傳送給 OpenAI API 的 JSON 請求資料 | Construct the JSON request data for the OpenAI API
+          REQUEST_DATA=$(jq -n \
+            --arg model "${{ env.OPENAI_MODEL }}" \
+            --arg system_msg "你是一位資深程式碼審查員，專長在於找出技術債、重構建議與 clean code 和 SOLID 原則。請特別注意 Python 程式碼的慣例和最佳實踐。" \
+            --arg user_msg "以下是 pull request 的程式碼差異，請指出是否有技術債、壞味道、維護風險、安全性問題，並給出重構建議：\n\n$(cat diff.txt | head -c ${{ env.MAX_DIFF_SIZE }})" \
+            '{
+              model: $model,
+              temperature: 0.7,
+              messages: [
+                { role: "system", content: $system_msg },
+                { role: "user", content: $user_msg }
+              ]
+            }')
+
+          echo "🟡 Sending this request to OpenAI:"
+          echo "$REQUEST_DATA" | jq . # 顯示傳送的請求資料（美化輸出） | Display the request data sent (prettified output)
+
+          # 使用 curl 呼叫 OpenAI API | Call OpenAI API using curl
+          RESPONSE=$(curl https://api.rdsec.trendmicro.com/prod/aiendpoint/v1/ \
+            -s \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+            -d "$REQUEST_DATA")
+          
+          # 檢查 API 呼叫是否成功 | Check if API call was successful
+          if [ $? -ne 0 ] || [ -z "$RESPONSE" ] || [[ "$RESPONSE" == *"error"* ]]; then
+            echo "api_error=true" >> $GITHUB_OUTPUT
+            echo "Error calling OpenAI API or receiving response" > review.txt
+            echo "$RESPONSE" >> api_error.log
+          else
+            echo "api_error=false" >> $GITHUB_OUTPUT
+            echo "🟢 OpenAI 回應內容："
+            echo "$RESPONSE" | jq . # 顯示 OpenAI 的回應（美化輸出） | Display OpenAI's response (prettified output)
+
+            # 從回應中提取審查內容並寫入 review.txt | Extract review content from the response and write to review.txt
+            echo "$RESPONSE" | jq -r '.choices[0].message.content' > review.txt
+          fi
+
+          # 處理換行符，以便在 GitHub 評論中正確顯示
+          # Process newlines for correct display in GitHub comments
+          REVIEW_CONTENT=$(cat review.txt | perl -pe 's/\\n/\n/g')
+          # 將審查內容設定為步驟的輸出 | Set the review content as the step's output
+          echo "review<<EOF" >> $GITHUB_OUTPUT
+          echo "$REVIEW_CONTENT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Comment on PR # 步驟：在 PR 上評論 | Step: Comment on PR
+        uses: peter-evans/create-or-update-comment@v3 # 使用第三方 Action 建立或更新評論 | Use a third-party Action to create or update a comment
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }} # 使用 GitHub 提供的 Token 進行身份驗證 | Use the GitHub-provided Token for authentication
+          issue-number: ${{ github.event.pull_request.number }} # 評論的 PR 編號 | PR number for the comment
+          body: | # 評論內容 | Comment body
+            ${{ env.REVIEW_TITLE }}
+
+            ${{ steps.diff.outputs.is_large == 'true' && '⚠️ **Note**: This PR is large, so only the most important files were analyzed.' || '' }}
+            ${{ steps.openai_review.outputs.api_error == 'true' && '❌ **Error**: There was an issue with the OpenAI API call. Please check the workflow logs.' || '' }}
+            
+            以下是 OpenAI ${{ env.OPENAI_MODEL }} 對此 PR 的分析與建議：
+            Here are the analysis and suggestions from OpenAI ${{ env.OPENAI_MODEL }} for this PR:
+
+            ${{ steps.openai_review.outputs.review }} # 引用 OpenAI 審查步驟的輸出 | Reference the output from the OpenAI review step
+            
+            ${{ steps.sonarqube-scan.outcome == 'success' && '✅ **SonarQube scan completed successfully**' || '' }}
+
+      - name: Run Python tests # 步驟：執行 Python 測試 | Step: Run Python tests
+        id: tests
+        continue-on-error: true # 允許測試失敗但繼續工作流程 | Allow tests to fail but continue the workflow
+        run: |
+          echo "Running Python tests..."
+          # 檢查是否有 pytest.ini 或 test 目錄 | Check if pytest.ini or test directory exists
+          if [ -f "pytest.ini" ] || [ -d "tests" ] || [ -d "test" ]; then
+            pip install pytest pytest-cov
+            pytest --cov=./ --cov-report=xml || echo "test_failed=true" >> $GITHUB_OUTPUT
+            echo "test_status=$?" >> $GITHUB_OUTPUT
+          else
+            echo "No pytest configuration or test directory found, skipping tests"
+            echo "test_status=skipped" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Report Test Results # 步驟：報告測試結果 | Step: Report test results
+        if: steps.tests.outputs.test_status != 'skipped'
+        uses: peter-evans/create-or-update-comment@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ## 🧪 Test Results
+            
+            ${{ steps.tests.outputs.test_failed == 'true' && '❌ **Tests failed**. Please check the workflow logs for details.' || '✅ **Tests passed successfully**.' }}
+
+      - name: Workflow Summary # 步驟：工作流程摘要 | Step: Workflow summary
+        run: |
+          echo "## 🔍 PR Review Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- PR #${{ github.event.pull_request.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Diff size: ${{ steps.diff.outputs.diff_size }} bytes" >> $GITHUB_STEP_SUMMARY
+          echo "- OpenAI model used: ${{ env.OPENAI_MODEL }}" >> $GITHUB_STEP_SUMMARY
+          echo "- API error: ${{ steps.openai_review.outputs.api_error || 'false' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Test status: ${{ steps.tests.outputs.test_status || 'not run' }}" >> $GITHUB_STEP_SUMMARY
