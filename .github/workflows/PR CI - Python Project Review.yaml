@@ -134,7 +134,7 @@ jobs:
           echo "$REQUEST_DATA" | jq . # 顯示傳送的請求資料（美化輸出） | Display the request data sent (prettified output)
 
           # 使用 curl 呼叫 OpenAI API | Call OpenAI API using curl
-          RESPONSE=$(curl https://api.rdsec.trendmicro.com/prod/aiendpoint/v1/ \
+          RESPONSE=$(curl https://api.rdsec.trendmicro.com/prod/aiendpoint/v1/chat/completions \
             -s \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
